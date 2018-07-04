@@ -175,7 +175,6 @@ pub fn glob_with<S: AsRef<OsStr> + ?Sized>(pattern: &S, options: &MatchOptions)
 
     #[cfg(windows)]
     fn check_windows_verbatim(p: &Path) -> bool {
-        use std::path::Prefix;
         match p.components().next() {
             Some(Component::Prefix(ref p)) => p.kind().is_verbatim(),
             _ => false,
@@ -405,10 +404,7 @@ impl Iterator for Paths {
 
             // not recursive, so match normally
             if self.dir_patterns[idx].matches_with({
-                match path.file_name().and_then(|s| s.to_str()) {
-                    // FIXME (#9639): How do we handle non-utf8 filenames?
-                    // Ignore them for now; ideally we'd still match them
-                    // against a *
+                match path.file_name() {
                     None => continue,
                     Some(x) => x
                 }
@@ -579,7 +575,7 @@ impl PlatformCharset<u16> for PatternCharset {
     fn period(&self) -> u16 { b'.' as _ }
 
     fn is_ascii(&self, ch: u16) -> bool {
-        ch <= u8::max_value() && (ch as u8).is_ascii()
+        ch <= u8::max_value() as u16 && (ch as u8).is_ascii()
     }
 
     fn to_ascii_lowercase(&self, ch: u16) -> u8 {
@@ -587,7 +583,7 @@ impl PlatformCharset<u16> for PatternCharset {
     }
 
     fn is_separator(&self, ch: u16) -> bool {
-        ch <= u8::max_value() && path::is_separator((ch as u8).into())
+        ch <= u8::max_value() as u16 && path::is_separator((ch as u8).into())
     }
 }
 
@@ -612,7 +608,7 @@ impl Pattern {
         let helper = || {
             use std::os::windows::ffi::OsStrExt;
 
-            Self::create_pattern(pattern.encode_wide().peek(), pattern.len(), PatternCharset)
+            Self::create_pattern(pattern.encode_wide().peekable(), pattern.len(), PatternCharset)
         };
 
         #[cfg(not(windows))]
@@ -725,13 +721,10 @@ impl Pattern {
                         match iter.clone().skip(2).position(|x| x == rbrack) {
                             None => (),
                             Some(j) => {
-                                // XXX: 1 + j?  2 + j?
                                 iter.next();
                                 let niter = iter.clone().take(j + 1);
                                 let cs = parse_char_specifiers(niter, &charset);
                                 tokens.push(AnyExcept(cs));
-                                // XXX: numbers
-                                // XXX: maybe can just give &mut iter?
                                 for _ in 0..j + 2 {
                                     iter.next();
                                 }
@@ -743,7 +736,6 @@ impl Pattern {
                         match iter.clone().skip(1).position(|x| x == rbrack) {
                             None => (),
                             Some(j) => {
-                                // XXX: 1 + j?
                                 let niter = iter.clone().take(j + 1);
                                 let cs = parse_char_specifiers(niter, &charset);
                                 tokens.push(AnyWithin(cs));
@@ -814,20 +806,20 @@ impl Pattern {
 
     /// Return if the given `str` matches this `Pattern` using the specified
     /// match options.
-    #[cfg(not(windows))]
     pub fn matches_with<S: AsRef<OsStr> + ?Sized>(&self, str: &S, options: &MatchOptions) -> bool {
-        use std::os::unix::ffi::OsStrExt;
+        #[cfg(not(windows))]
+        {
+            use std::os::unix::ffi::OsStrExt;
 
-        self.matches_from(true, str.as_ref().as_bytes().iter().map(|&b| b), 0, options, &PatternCharset) == Match
-    }
+            self.matches_from(true, str.as_ref().as_bytes().iter().map(|&b| b), 0, options, &PatternCharset) == Match
+        }
 
-    /// Return if the given `str` matches this `Pattern` using the specified
-    /// match options.
-    #[cfg(windows)]
-    pub fn matches_with<S: AsRef<OsStr> + ?Sized>(&self, str: &S, option: &MatchOptions) -> bool {
-        use std::os::unix::ffi::OsStrExt;
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStrExt;
 
-        self.matches_from(true, str.as_ref().encode_wide(), 0, options, &PatternCharset) == Match
+            self.matches_from(true, str.as_ref().encode_wide(), 0, options, &PatternCharset) == Match
+        }
     }
 
     /// Access the original glob pattern.
@@ -1225,15 +1217,17 @@ mod test {
         #[cfg(windows)]
         fn win() {
             use std::env::current_dir;
-            use std::ffi::AsOsStr;
+            use std::path::{Component, Path};
 
             // check windows absolute paths with host/device components
             let root_with_device = current_dir()
                                        .ok()
-                                       .and_then(|p| p.prefix().map(|p| p.join("*")))
+                                       .and_then(|p| match p.components().next() {
+                                           Some(Component::Prefix(prefix)) => Some(Path::new(prefix.as_os_str()).join("*")),
+                                           _ => None,
+                                       })
                                        .unwrap();
-            // FIXME (#9639): This needs to handle non-utf8 paths
-            assert!(glob(root_with_device.as_os_str().to_str().unwrap()).unwrap().next().is_some());
+            assert!(glob(&root_with_device).unwrap().next().is_some());
         }
         win()
     }
