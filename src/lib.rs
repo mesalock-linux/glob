@@ -63,10 +63,11 @@
 
 #[allow(unused_imports)]
 use std::ascii::AsciiExt;
-use std::cmp;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs;
 use std::io;
+use std::iter::Peekable;
 use std::path::{self, Path, PathBuf, Component};
 use std::str::FromStr;
 use std::error::Error;
@@ -150,7 +151,7 @@ pub struct Paths {
 /// }
 /// ```
 /// Paths are yielded in alphabetical order.
-pub fn glob(pattern: &str) -> Result<Paths, PatternError> {
+pub fn glob<S: AsRef<OsStr> + ?Sized>(pattern: &S) -> Result<Paths, PatternError> {
     glob_with(pattern, &MatchOptions::new())
 }
 
@@ -167,7 +168,7 @@ pub fn glob(pattern: &str) -> Result<Paths, PatternError> {
 /// passed to this function.
 ///
 /// Paths are yielded in alphabetical order.
-pub fn glob_with(pattern: &str, options: &MatchOptions)
+pub fn glob_with<S: AsRef<OsStr> + ?Sized>(pattern: &S, options: &MatchOptions)
                  -> Result<Paths, PatternError> {
     // make sure that the pattern is valid first, else early return with error
     let _compiled = try!(Pattern::new(pattern));
@@ -195,26 +196,22 @@ pub fn glob_with(pattern: &str, options: &MatchOptions)
         p.to_path_buf()
     }
 
+    let mut root = PathBuf::new();
     let mut components = Path::new(pattern).components().peekable();
     loop {
         match components.peek() {
-            Some(&Component::Prefix(..)) |
-            Some(&Component::RootDir) => {
-                components.next();
+            Some(comp @ &Component::Prefix(..)) |
+            Some(comp @ &Component::RootDir) => {
+                root.push(comp);
             }
             _ => break,
         }
+        components.next();
     }
     let rest = components.map(|s| s.as_os_str()).collect::<PathBuf>();
-    let normalized_pattern = Path::new(pattern).iter().collect::<PathBuf>();
-    let root_len = normalized_pattern.to_str().unwrap().len() - rest.to_str().unwrap().len();
-    let root = if root_len > 0 {
-        Some(Path::new(&pattern[..root_len]))
-    } else {
-        None
-    };
+    let root_len = root.as_os_str().len();
 
-    if root_len > 0 && check_windows_verbatim(root.unwrap()) {
+    if root_len > 0 && check_windows_verbatim(&root) {
         // FIXME: How do we want to handle verbatim paths? I'm inclined to
         // return nothing, since we can't very well find all UNC shares with a
         // 1-letter server name.
@@ -227,11 +224,23 @@ pub fn glob_with(pattern: &str, options: &MatchOptions)
         });
     }
 
-    let scope = root.map(to_scope).unwrap_or_else(|| PathBuf::from("."));
+    let rest = if rest.as_os_str().len() == 0 {
+        root.clone()
+    } else {
+        rest
+    };
+    let components = rest.iter();
+
+    let scope = if root_len > 0 {
+        to_scope(&root)
+    } else {
+        root.push(".");
+        root
+    };
+
+    let pattern = pattern.as_ref();
 
     let mut dir_patterns = Vec::new();
-    let components = pattern[cmp::min(root_len, pattern.len())..]
-                         .split_terminator(path::is_separator);
 
     for component in components {
         let compiled = try!(Pattern::new(component));
@@ -240,13 +249,14 @@ pub fn glob_with(pattern: &str, options: &MatchOptions)
 
     if root_len == pattern.len() {
         dir_patterns.push(Pattern {
-            original: "".to_string(),
+            original: OsString::from(""),
             tokens: Vec::new(),
             is_recursive: false,
         });
     }
 
-    let last_is_separator = pattern.chars().next_back().map(path::is_separator);
+    // FIXME: would be ideal not to convert into a string if we can help it
+    let last_is_separator = pattern.to_string_lossy().chars().next_back().map(path::is_separator);
     let require_dir = last_is_separator == Some(true);
     let todo = Vec::new();
 
@@ -473,15 +483,15 @@ impl fmt::Display for PatternError {
 ///   it at the start or the end, e.g. `[abc-]`.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Debug)]
 pub struct Pattern {
-    original: String,
-    tokens: Vec<PatternToken>,
+    original: OsString,
+    tokens: Vec<PatternToken<OsStrByte>>,
     is_recursive: bool,
 }
 
 /// Show the original glob pattern.
 impl fmt::Display for Pattern {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        self.original.fmt(f)
+        self.original.to_string_lossy().fmt(f)
     }
 }
 
@@ -494,19 +504,19 @@ impl FromStr for Pattern {
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-enum PatternToken {
-    Char(char),
+enum PatternToken<T> {
+    Char(T),
     AnyChar,
     AnySequence,
     AnyRecursiveSequence,
-    AnyWithin(Vec<CharSpecifier>),
-    AnyExcept(Vec<CharSpecifier>),
+    AnyWithin(Vec<CharSpecifier<T>>),
+    AnyExcept(Vec<CharSpecifier<T>>),
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-enum CharSpecifier {
-    SingleChar(char),
-    CharRange(char, char),
+enum CharSpecifier<T> {
+    SingleChar(T),
+    CharRange(T, T),
 }
 
 #[derive(Copy, Clone, PartialEq)]
@@ -515,6 +525,76 @@ enum MatchResult {
     SubPatternDoesntMatch,
     EntirePatternDoesntMatch,
 }
+
+trait PlatformCharset<T> {
+    fn slash(&self) -> T;
+    fn question(&self) -> T;
+    fn asterisk(&self) -> T;
+    fn left_bracket(&self) -> T;
+    fn right_bracket(&self) -> T;
+    fn exclamation(&self) -> T;
+    fn minus(&self) -> T;
+    fn period(&self) -> T;
+
+    fn is_ascii(&self, ch: T) -> bool;
+    fn to_ascii_lowercase(&self, ch: T) -> u8;
+    fn is_separator(&self, ch: T) -> bool;
+}
+
+struct PatternCharset;
+
+#[cfg(not(windows))]
+impl PlatformCharset<u8> for PatternCharset {
+    fn slash(&self) -> u8 { b'/' }
+    fn question(&self) -> u8 { b'?' }
+    fn asterisk(&self) -> u8 { b'*' }
+    fn left_bracket(&self) -> u8 { b'[' }
+    fn right_bracket(&self) -> u8 { b']' }
+    fn exclamation(&self) -> u8 { b'!' }
+    fn minus(&self) -> u8 { b'-' }
+    fn period(&self) -> u8 { b'.' }
+
+    fn is_ascii(&self, ch: u8) -> bool {
+        ch.is_ascii()
+    }
+
+    fn to_ascii_lowercase(&self, ch: u8) -> u8 {
+        ch.to_ascii_lowercase()
+    }
+
+    fn is_separator(&self, ch: u8) -> bool {
+        path::is_separator(ch.into())
+    }
+}
+
+#[cfg(windows)]
+impl PlatformCharset<u16> for PatternCharset {
+    fn slash(&self) -> u16 { b'/' as _ }
+    fn question(&self) -> u16 { b'?' as _ }
+    fn asterisk(&self) -> u16 { b'*' as _ }
+    fn left_bracket(&self) -> u16 { b'[' as _ }
+    fn right_bracket(&self) -> u16 { b']' as _ }
+    fn exclamation(&self) -> u16 { b'!' as _ }
+    fn minus(&self) -> u16 { b'-' as _ }
+    fn period(&self) -> u16 { b'.' as _ }
+
+    fn is_ascii(&self, ch: u16) -> bool {
+        ch <= u8::max_value() && (ch as u8).is_ascii()
+    }
+
+    fn to_ascii_lowercase(&self, ch: u16) -> u8 {
+        (ch as u8).to_ascii_lowercase()
+    }
+
+    fn is_separator(&self, ch: u16) -> bool {
+        ch <= u8::max_value() && path::is_separator((ch as u8).into())
+    }
+}
+
+#[cfg(not(windows))]
+type OsStrByte = u8;
+#[cfg(windows)]
+type OsStrByte = u16;
 
 const ERROR_WILDCARDS: &'static str = "wildcards are either regular `*` or recursive `**`";
 const ERROR_RECURSIVE_WILDCARDS: &'static str = "recursive wildcards must form a single path \
@@ -525,24 +605,64 @@ impl Pattern {
     /// This function compiles Unix shell style patterns.
     ///
     /// An invalid glob pattern will yield a `PatternError`.
-    pub fn new(pattern: &str) -> Result<Pattern, PatternError> {
+    pub fn new<S: AsRef<OsStr> + ?Sized>(pattern: &S) -> Result<Pattern, PatternError> {
+        let pattern = pattern.as_ref();
 
-        let chars = pattern.chars().collect::<Vec<_>>();
+        #[cfg(windows)]
+        let helper = || {
+            use std::os::windows::ffi::OsStrExt;
+
+            Self::create_pattern(pattern.encode_wide().peek(), pattern.len(), PatternCharset)
+        };
+
+        #[cfg(not(windows))]
+        let helper = || {
+            use std::os::unix::ffi::OsStrExt;
+
+            Self::create_pattern(pattern.as_bytes().iter().map(|&b| b).peekable(), pattern.len(), PatternCharset)
+        };
+
+        let (tokens, is_recursive) = helper()?;
+
+        Ok(Pattern {
+            tokens: tokens,
+            original: pattern.to_owned(),
+            is_recursive: is_recursive,
+        })
+    }
+
+    fn create_pattern<I>(mut iter: Peekable<I>, len: usize, charset: PatternCharset) -> Result<(Vec<PatternToken<OsStrByte>>, bool), PatternError>
+    where
+        I: Iterator<Item = OsStrByte> + Clone,
+    {
         let mut tokens = Vec::new();
         let mut is_recursive = false;
         let mut i = 0;
 
-        while i < chars.len() {
-            match chars[i] {
-                '?' => {
+        let question = charset.question();
+        let asterisk = charset.asterisk();
+        let lbrack = charset.left_bracket();
+
+        // NOTE: it doesn't matter what this value is as we don't use it until it has already been
+        //       set to another value
+        let mut prev_ch = 0;
+
+        while let Some(ch) = iter.next() {
+            match ch {
+                ch if ch == question => {
                     tokens.push(AnyChar);
                     i += 1;
                 }
-                '*' => {
+                ch if ch == asterisk => {
                     let old = i;
+                    i += 1;
 
-                    while i < chars.len() && chars[i] == '*' {
+                    while let Some(&ch) = iter.peek() {
+                        if ch != asterisk {
+                            break;
+                        }
                         i += 1;
+                        iter.next();
                     }
 
                     let count = i - old;
@@ -556,14 +676,15 @@ impl Pattern {
                         // ** can only be an entire path component
                         // i.e. a/**/b is valid, but a**/b or a/**b is not
                         // invalid matches are treated literally
-                        let is_valid = if i == 2 || path::is_separator(chars[i - count - 1]) {
+                        let is_valid = if i == 2 || charset.is_separator(prev_ch) {
                             // it ends in a '/'
-                            if i < chars.len() && path::is_separator(chars[i]) {
+                            if i < len && charset.is_separator(*iter.peek().unwrap()) {
+                                prev_ch = iter.next().unwrap();
                                 i += 1;
                                 true
                                 // or the pattern ends here
                                 // this enables the existing globbing mechanism
-                            } else if i == chars.len() {
+                            } else if i == len {
                                 true
                                 // `**` ends in non-separator
                             } else {
@@ -591,29 +712,45 @@ impl Pattern {
                             }
                         }
                     } else {
+                        prev_ch = asterisk;
                         tokens.push(AnySequence);
                     }
                 }
-                '[' => {
+                ch if ch == lbrack => {
+                    let exclamation = charset.exclamation();
+                    let rbrack = charset.right_bracket();
 
-                    if i + 4 <= chars.len() && chars[i + 1] == '!' {
-                        match chars[i + 3..].iter().position(|x| *x == ']') {
+                    prev_ch = rbrack;
+                    if i + 4 <= len && iter.peek() == Some(&exclamation) {
+                        match iter.clone().skip(2).position(|x| x == rbrack) {
                             None => (),
                             Some(j) => {
-                                let chars = &chars[i + 2..i + 3 + j];
-                                let cs = parse_char_specifiers(chars);
+                                // XXX: 1 + j?  2 + j?
+                                iter.next();
+                                let niter = iter.clone().take(j + 1);
+                                let cs = parse_char_specifiers(niter, &charset);
                                 tokens.push(AnyExcept(cs));
-                                i += j + 4;
+                                // XXX: numbers
+                                // XXX: maybe can just give &mut iter?
+                                for _ in 0..j + 2 {
+                                    iter.next();
+                                }
+                                i += j + 3;
                                 continue;
                             }
                         }
-                    } else if i + 3 <= chars.len() && chars[i + 1] != '!' {
-                        match chars[i + 2..].iter().position(|x| *x == ']') {
+                    } else if i + 3 <= len && iter.peek() != Some(&exclamation) {
+                        match iter.clone().skip(1).position(|x| x == rbrack) {
                             None => (),
                             Some(j) => {
-                                let cs = parse_char_specifiers(&chars[i + 1..i + 2 + j]);
+                                // XXX: 1 + j?
+                                let niter = iter.clone().take(j + 1);
+                                let cs = parse_char_specifiers(niter, &charset);
                                 tokens.push(AnyWithin(cs));
-                                i += j + 3;
+                                for _ in 0..j + 2 {
+                                    iter.next();
+                                }
+                                i += j + 2;
                                 continue;
                             }
                         }
@@ -628,20 +765,18 @@ impl Pattern {
                 c => {
                     tokens.push(Char(c));
                     i += 1;
+                    prev_ch = c;
                 }
             }
         }
 
-        Ok(Pattern {
-            tokens: tokens,
-            original: pattern.to_string(),
-            is_recursive: is_recursive,
-        })
+        Ok((tokens, is_recursive))
     }
 
     /// Escape metacharacters within the given string by surrounding them in
     /// brackets. The resulting string will, when compiled into a `Pattern`,
     /// match the input string and nothing else.
+    // TODO: maybe change to AsRef<OsStr>
     pub fn escape(s: &str) -> String {
         let mut escaped = String::new();
         for c in s.chars() {
@@ -673,40 +808,44 @@ impl Pattern {
     /// assert!(Pattern::new("k[!e]tteh").unwrap().matches("kitteh"));
     /// assert!(Pattern::new("d*g").unwrap().matches("doog"));
     /// ```
-    pub fn matches(&self, str: &str) -> bool {
+    pub fn matches<S: AsRef<OsStr> + ?Sized>(&self, str: &S) -> bool {
         self.matches_with(str, &MatchOptions::new())
-    }
-
-    /// Return if the given `Path`, when converted to a `str`, matches this
-    /// `Pattern` using the default match options (i.e. `MatchOptions::new()`).
-    pub fn matches_path(&self, path: &Path) -> bool {
-        // FIXME (#9639): This needs to handle non-utf8 paths
-        path.to_str().map_or(false, |s| self.matches(s))
     }
 
     /// Return if the given `str` matches this `Pattern` using the specified
     /// match options.
-    pub fn matches_with(&self, str: &str, options: &MatchOptions) -> bool {
-        self.matches_from(true, str.chars(), 0, options) == Match
+    #[cfg(not(windows))]
+    pub fn matches_with<S: AsRef<OsStr> + ?Sized>(&self, str: &S, options: &MatchOptions) -> bool {
+        use std::os::unix::ffi::OsStrExt;
+
+        self.matches_from(true, str.as_ref().as_bytes().iter().map(|&b| b), 0, options, &PatternCharset) == Match
     }
 
-    /// Return if the given `Path`, when converted to a `str`, matches this
-    /// `Pattern` using the specified match options.
-    pub fn matches_path_with(&self, path: &Path, options: &MatchOptions) -> bool {
-        // FIXME (#9639): This needs to handle non-utf8 paths
-        path.to_str().map_or(false, |s| self.matches_with(s, options))
+    /// Return if the given `str` matches this `Pattern` using the specified
+    /// match options.
+    #[cfg(windows)]
+    pub fn matches_with<S: AsRef<OsStr> + ?Sized>(&self, str: &S, option: &MatchOptions) -> bool {
+        use std::os::unix::ffi::OsStrExt;
+
+        self.matches_from(true, str.as_ref().encode_wide(), 0, options, &PatternCharset) == Match
     }
 
     /// Access the original glob pattern.
-    pub fn as_str<'a>(&'a self) -> &'a str {
+    pub fn as_os_str(&self) -> &OsStr {
         &self.original
     }
 
-    fn matches_from(&self,
+    /// Access the original glob pattern as an &str.
+    pub fn to_str(&self) -> Option<&str> {
+        self.original.to_str()
+    }
+
+    fn matches_from<I: Iterator<Item = OsStrByte> + Clone>(&self,
                     mut follows_separator: bool,
-                    mut file: std::str::Chars,
+                    mut file: I,
                     i: usize,
-                    options: &MatchOptions)
+                    options: &MatchOptions,
+                    charset: &PatternCharset)
                     -> MatchResult {
 
         for (ti, token) in self.tokens[i..].iter().enumerate() {
@@ -719,16 +858,16 @@ impl Pattern {
                     });
 
                     // Empty match
-                    match self.matches_from(follows_separator, file.clone(), i + ti + 1, options) {
+                    match self.matches_from(follows_separator, file.clone(), i + ti + 1, options, charset) {
                         SubPatternDoesntMatch => (), // keep trying
                         m => return m,
                     };
 
                     while let Some(c) = file.next() {
-                        if follows_separator && options.require_literal_leading_dot && c == '.' {
+                        if follows_separator && options.require_literal_leading_dot && c == charset.period() {
                             return SubPatternDoesntMatch;
                         }
-                        follows_separator = path::is_separator(c);
+                        follows_separator = charset.is_separator(c);
                         match *token {
                             AnyRecursiveSequence if !follows_separator => continue,
                             AnySequence if options.require_literal_separator &&
@@ -738,7 +877,8 @@ impl Pattern {
                         match self.matches_from(follows_separator,
                                                 file.clone(),
                                                 i + ti + 1,
-                                                options) {
+                                                options,
+                                                charset) {
                             SubPatternDoesntMatch => (), // keep trying
                             m => return m,
                         }
@@ -750,17 +890,17 @@ impl Pattern {
                         None => return EntirePatternDoesntMatch,
                     };
 
-                    let is_sep = path::is_separator(c);
+                    let is_sep = charset.is_separator(c);
 
                     if !match *token {
                         AnyChar | AnyWithin(..) | AnyExcept(..)
                             if (options.require_literal_separator && is_sep) ||
                             (follows_separator && options.require_literal_leading_dot &&
-                             c == '.') => false,
+                             c == charset.period()) => false,
                         AnyChar => true,
-                        AnyWithin(ref specifiers) => in_char_specifiers(&specifiers, c, options),
-                        AnyExcept(ref specifiers) => !in_char_specifiers(&specifiers, c, options),
-                        Char(c2) => chars_eq(c, c2, options.case_sensitive),
+                        AnyWithin(ref specifiers) => in_char_specifiers(&specifiers, c, options, charset),
+                        AnyExcept(ref specifiers) => !in_char_specifiers(&specifiers, c, options, charset),
+                        Char(c2) => chars_eq(c, c2, options.case_sensitive, charset),
                         AnySequence | AnyRecursiveSequence => unreachable!(),
                     } {
                         return SubPatternDoesntMatch;
@@ -787,16 +927,28 @@ fn fill_todo(todo: &mut Vec<Result<(PathBuf, usize), GlobError>>,
              idx: usize,
              path: &Path,
              options: &MatchOptions) {
+    #[cfg(windows)]
+    fn from_vec(s: Vec<u16>) -> OsString {
+        use std::os::windows::ffi::OsStringExt;
+        OsString::from_wide(&s)
+    }
+
+    #[cfg(not(windows))]
+    fn from_vec(s: Vec<u8>) -> OsString {
+        use std::os::unix::ffi::OsStringExt;
+        OsString::from_vec(s)
+    }
+
     // convert a pattern that's just many Char(_) to a string
-    fn pattern_as_str(pattern: &Pattern) -> Option<String> {
-        let mut s = String::new();
+    fn pattern_as_str(pattern: &Pattern) -> Option<OsString> {
+        let mut s = vec![];
         for token in pattern.tokens.iter() {
             match *token {
                 Char(c) => s.push(c),
                 _ => return None,
             }
         }
-        return Some(s);
+        return Some(from_vec(s));
     }
 
     let add = |todo: &mut Vec<_>, next_path: PathBuf| {
@@ -820,7 +972,7 @@ fn fill_todo(todo: &mut Vec<Result<(PathBuf, usize), GlobError>>,
             // continue. So instead of passing control back to the iterator,
             // we can just check for that one entry and potentially recurse
             // right away.
-            let special = "." == s || ".." == s;
+            let special = OsStr::new(".") == s || OsStr::new("..") == s;
             let next_path = if curdir {
                 PathBuf::from(s)
             } else {
@@ -853,7 +1005,7 @@ fn fill_todo(todo: &mut Vec<Result<(PathBuf, usize), GlobError>>,
                     // requires that the pattern has a leading dot, even if the
                     // `MatchOptions` field `require_literal_leading_dot` is not
                     // set.
-                    if pattern.tokens.len() > 0 && pattern.tokens[0] == Char('.') {
+                    if pattern.tokens.len() > 0 && pattern.tokens[0] == Char(PatternCharset.period()) {
                         for &special in [".", ".."].iter() {
                             if pattern.matches_with(special, options) {
                                 add(todo, path.join(special));
@@ -875,45 +1027,52 @@ fn fill_todo(todo: &mut Vec<Result<(PathBuf, usize), GlobError>>,
     }
 }
 
-fn parse_char_specifiers(s: &[char]) -> Vec<CharSpecifier> {
+fn parse_char_specifiers<I, T, C>(mut iter: I, charset: &C) -> Vec<CharSpecifier<T>>
+where
+    I: Iterator<Item = T> + Clone,
+    T: PartialEq,
+    C: PlatformCharset<T>,
+{
     let mut cs = Vec::new();
-    let mut i = 0;
-    while i < s.len() {
-        if i + 3 <= s.len() && s[i + 1] == '-' {
-            cs.push(CharRange(s[i], s[i + 2]));
-            i += 3;
+    while let Some(ch) = iter.next() {
+        let mut niter = iter.clone();
+        if niter.next() == Some(charset.minus()) && niter.next().is_some() {
+            iter.next();
+            cs.push(CharRange(ch, iter.next().unwrap()));
         } else {
-            cs.push(SingleChar(s[i]));
-            i += 1;
+            cs.push(SingleChar(ch));
         }
     }
     cs
 }
 
-fn in_char_specifiers(specifiers: &[CharSpecifier], c: char, options: &MatchOptions) -> bool {
-
+fn in_char_specifiers<T, C>(specifiers: &[CharSpecifier<T>], c: T, options: &MatchOptions, charset: &C) -> bool
+where
+    T: PartialEq + PartialOrd + Copy,
+    C: PlatformCharset<T>,
+{
     for &specifier in specifiers.iter() {
         match specifier {
             SingleChar(sc) => {
-                if chars_eq(c, sc, options.case_sensitive) {
+                if chars_eq(c, sc, options.case_sensitive, charset) {
                     return true;
                 }
             }
             CharRange(start, end) => {
 
                 // FIXME: work with non-ascii chars properly (issue #1347)
-                if !options.case_sensitive && c.is_ascii() && start.is_ascii() && end.is_ascii() {
+                if !options.case_sensitive && charset.is_ascii(c) && charset.is_ascii(start) && charset.is_ascii(end) {
 
-                    let start = start.to_ascii_lowercase();
-                    let end = end.to_ascii_lowercase();
+                    let start = charset.to_ascii_lowercase(start);
+                    let end = charset.to_ascii_lowercase(end);
 
-                    let start_up = start.to_uppercase().next().unwrap();
-                    let end_up = end.to_uppercase().next().unwrap();
+                    let start_up = start.to_ascii_uppercase();
+                    let end_up = end.to_ascii_uppercase();
 
                     // only allow case insensitive matching when
                     // both start and end are within a-z or A-Z
                     if start != start_up && end != end_up {
-                        let c = c.to_ascii_lowercase();
+                        let c = charset.to_ascii_lowercase(c);
                         if c >= start && c <= end {
                             return true;
                         }
@@ -931,12 +1090,16 @@ fn in_char_specifiers(specifiers: &[CharSpecifier], c: char, options: &MatchOpti
 }
 
 /// A helper function to determine if two chars are (possibly case-insensitively) equal.
-fn chars_eq(a: char, b: char, case_sensitive: bool) -> bool {
-    if cfg!(windows) && path::is_separator(a) && path::is_separator(b) {
+fn chars_eq<T, C>(a: T, b: T, case_sensitive: bool, charset: &C) -> bool
+where
+    T: PartialEq + Copy,
+    C: PlatformCharset<T>,
+{
+    if cfg!(windows) && charset.is_separator(a) && charset.is_separator(b) {
         true
-    } else if !case_sensitive && a.is_ascii() && b.is_ascii() {
+    } else if !case_sensitive && charset.is_ascii(a) && charset.is_ascii(b) {
         // FIXME: work with non-ascii chars properly (issue #9084)
-        a.to_ascii_lowercase() == b.to_ascii_lowercase()
+        charset.to_ascii_lowercase(a) == charset.to_ascii_lowercase(b)
     } else {
         a == b
     }
@@ -1352,7 +1515,7 @@ mod test {
     fn test_matches_path() {
         // on windows, (Path::new("a/b").as_str().unwrap() == "a\\b"), so this
         // tests that / and \ are considered equivalent on windows
-        assert!(Pattern::new("a/b").unwrap().matches_path(&Path::new("a/b")));
+        assert!(Pattern::new("a/b").unwrap().matches(&Path::new("a/b")));
     }
 
     #[test]
